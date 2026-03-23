@@ -28,15 +28,20 @@ func Start(cfg *config.Config, st *store.Store, reloadCh <-chan struct{}) {
 			<-reloadCh
 			continue
 		}
+		logger.Infof("Telegram token resolved from DB: exists=%v masked=%s len=%d", token != "", maskToken(token), len(token))
 
-		stopped := runBot(token, cfg, st)
+		stopped := runBot(token, cfg, st, reloadCh)
 		if !stopped {
-			return
+			if reloadCh == nil {
+				return
+			}
+			logger.Warn("Telegram bot stopped due to startup/auth failure; waiting for reload signal...")
+			<-reloadCh
+			continue
 		}
 
-		select {
-		case <-reloadCh:
-			logger.Info("Reloading Telegram bot with new token...")
+		if reloadCh != nil {
+			logger.Info("Reloading Telegram bot with latest token...")
 		}
 	}
 }
@@ -50,14 +55,30 @@ func resolveToken(cfg *config.Config, st *store.Store) string {
 	return ""
 }
 
-// runBot runs the bot until the updates channel closes (clean stop → true) or a fatal error (false).
-func runBot(token string, cfg *config.Config, st *store.Store) bool {
+func maskToken(token string) string {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return "<empty>"
+	}
+	if len(token) <= 6 {
+		return "***"
+	}
+	return "***" + token[len(token)-6:]
+}
+
+// runBot runs the bot until a reload is requested (true) or a fatal error occurs (false).
+func runBot(token string, cfg *config.Config, st *store.Store, reloadCh <-chan struct{}) bool {
 	bot, err := tgbotapi.NewBotAPI(token)
 	if err != nil {
-		logger.Errorf("Telegram bot failed to start: %v", err)
+		logger.Errorf("Telegram bot failed to start: masked=%s err=%v", maskToken(token), err)
 		return false
 	}
-	logger.Infof("Telegram bot @%s started", bot.Self.UserName)
+	me, err := bot.GetMe()
+	if err != nil {
+		logger.Errorf("Telegram getMe failed: masked=%s err=%v", maskToken(token), err)
+		return false
+	}
+	logger.Infof("Telegram bot @%s started (id=%d masked=%s)", me.UserName, me.ID, maskToken(token))
 
 	// Allowed chat ID: read from DB binding (0 = unbound, first /start will bind).
 	allowedChatID := int64(0)
@@ -105,15 +126,14 @@ func runBot(token string, cfg *config.Config, st *store.Store) bool {
 	resolveBotUser()
 
 	u := tgbotapi.NewUpdate(0)
-	u.Timeout = 60
-	updates := bot.GetUpdatesChan(u)
+	u.Timeout = 5
 
 	// awaitingLang is set only when the user explicitly runs /lang.
 	awaitingLang := false
 
-	for update := range updates {
+	processUpdate := func(update tgbotapi.Update) {
 		if update.Message == nil {
-			continue
+			return
 		}
 		chatID := update.Message.Chat.ID
 		text := strings.TrimSpace(update.Message.Text)
@@ -127,7 +147,7 @@ func runBot(token string, cfg *config.Config, st *store.Store) bool {
 			} else {
 				sendMarkdownMsg(bot, chatID, langMenuMsg())
 			}
-			continue
+			return
 		}
 
 		// ── /start ────────────────────────────────────────────────────────────
@@ -136,60 +156,60 @@ func runBot(token string, cfg *config.Config, st *store.Store) bool {
 			if botUserID == "" {
 				sendMsg(bot, chatID,
 					"No account found.\nOpen the web dashboard to register, then send /start.")
-				continue
+				return
 			}
 			if allowedChatID == 0 {
 				username := update.Message.From.UserName
 				if err := st.TelegramConfig().BindUser(chatID, "@"+username); err != nil {
 					logger.Errorf("Failed to bind Telegram user: %v", err)
 					sendMsg(bot, chatID, "Binding failed. Please try again.")
-					continue
+					return
 				}
 				allowedChatID = chatID
 				logger.Infof("Telegram bound to @%s (chatID: %d)", username, chatID)
 			} else if chatID != allowedChatID {
 				sendMsg(bot, chatID, "This bot is already bound to another account.")
-				continue
+				return
 			} else {
 				agents.Reset(chatID)
 			}
 			lang := st.TelegramConfig().GetLanguage()
 			sendMarkdownMsg(bot, chatID, statusMsg(st, botUserID, cfg.APIServerPort, lang))
-			continue
+			return
 		}
 
 		// ── /lang ─────────────────────────────────────────────────────────────
 		if text == "/lang" {
 			awaitingLang = true
 			sendMarkdownMsg(bot, chatID, langMenuMsg())
-			continue
+			return
 		}
 
 		// ── /help ─────────────────────────────────────────────────────────────
 		if text == "/help" {
 			lang := st.TelegramConfig().GetLanguage()
 			sendMarkdownMsg(bot, chatID, helpMsg(lang))
-			continue
+			return
 		}
 
 		// ── Access control ────────────────────────────────────────────────────
 		if allowedChatID != 0 && chatID != allowedChatID {
 			sendMsg(bot, chatID, "Unauthorized.")
-			continue
+			return
 		}
 		if allowedChatID == 0 {
 			sendMsg(bot, chatID, "Send /start first.")
-			continue
+			return
 		}
 		if text == "" {
-			continue
+			return
 		}
 
 		// ── Refresh user before every AI call ────────────────────────────────
 		resolveBotUser()
 		if botUserID == "" {
 			sendMsg(bot, chatID, "No account found. Open the web dashboard to register.")
-			continue
+			return
 		}
 
 		lang := st.TelegramConfig().GetLanguage()
@@ -197,7 +217,7 @@ func runBot(token string, cfg *config.Config, st *store.Store) bool {
 		// ── Guard: show status if not ready for trading ───────────────────────
 		if newLLMClient(st, botUserID) == nil {
 			sendMarkdownMsg(bot, chatID, statusMsg(st, botUserID, cfg.APIServerPort, lang))
-			continue
+			return
 		}
 
 		// ── AI agent ─────────────────────────────────────────────────────────
@@ -246,7 +266,36 @@ func runBot(token string, cfg *config.Config, st *store.Store) bool {
 		}(chatID, text)
 	}
 
-	return true
+	for {
+		select {
+		case <-reloadCh:
+			logger.Infof("Telegram reload requested; stopping current bot (masked=%s)", maskToken(token))
+			return true
+		default:
+		}
+
+		updates, err := bot.GetUpdates(u)
+		if err != nil {
+			logger.Errorf("Telegram getUpdates failed: masked=%s err=%v", maskToken(token), err)
+			if reloadCh != nil {
+				select {
+				case <-reloadCh:
+					logger.Infof("Telegram reload requested after polling error (masked=%s)", maskToken(token))
+					return true
+				case <-time.After(3 * time.Second):
+					continue
+				}
+			}
+			time.Sleep(3 * time.Second)
+			continue
+		}
+		for _, update := range updates {
+			if update.UpdateID >= u.Offset {
+				u.Offset = update.UpdateID + 1
+			}
+			processUpdate(update)
+		}
+	}
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

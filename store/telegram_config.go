@@ -81,9 +81,15 @@ func (s *telegramConfigStore) Save(botToken, modelID string) error {
 	if result.Error != nil && !errors.Is(result.Error, gorm.ErrRecordNotFound) {
 		return result.Error
 	}
+	tokenChanged := cfg.BotToken != "" && cfg.BotToken != botToken
 	cfg.ID = 1
 	cfg.BotToken = botToken
 	cfg.ModelID = modelID
+	if tokenChanged {
+		cfg.ChatID = 0
+		cfg.Username = ""
+		cfg.BoundAt = time.Time{}
+	}
 	return s.db.Save(&cfg).Error
 }
 
@@ -134,6 +140,7 @@ func (s *telegramConfigStore) Unbind() error {
 	return s.db.Model(&TelegramConfig{}).Where("id = 1").Updates(map[string]interface{}{
 		"chat_id":  0,
 		"username": "",
+		"bound_at": time.Time{},
 	}).Error
 }
 

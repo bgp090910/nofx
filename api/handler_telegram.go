@@ -2,8 +2,12 @@ package api
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+
+	"nofx/logger"
 )
 
 // handleGetTelegramConfig returns current Telegram bot configuration and binding status
@@ -50,8 +54,21 @@ func (s *Server) handleUpdateTelegramConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
 		return
 	}
+	req.BotToken = strings.TrimSpace(req.BotToken)
 	if req.BotToken == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "bot_token is required"})
+		return
+	}
+
+	bot, err := tgbotapi.NewBotAPI(req.BotToken)
+	if err != nil {
+		logger.Warnf("Telegram token validation failed during save: err=%v", err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid Telegram bot token"})
+		return
+	}
+	if _, err := bot.GetMe(); err != nil {
+		logger.Warnf("Telegram getMe failed during save: err=%v", err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "telegram token failed validation"})
 		return
 	}
 
